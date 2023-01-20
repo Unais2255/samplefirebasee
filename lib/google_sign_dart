@@ -1,0 +1,276 @@
+mport 'dart:async';
+import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart' show PlatformException;
+import 'package:google_sign_in_platform_interface/google_sign_in_platform_interface.dart';
+import 'src/common.dart';
+
+export 'package:google_sign_in_platform_interface/google_sign_in_platform_interface.dart'
+    show SignInOption;
+
+export 'src/common.dart';
+export 'widgets.dart';
+
+class GoogleSignInAuthentication {
+  GoogleSignInAuthentication._(this._data);
+
+  final GoogleSignInTokenData _data;
+
+  String? get idToken => _data.idToken;
+
+  String? get accessToken => _data.accessToken;
+
+  @Deprecated('Use the `GoogleSignInAccount.serverAuthCode` property instead')
+  String? get serverAuthCode => _data.serverAuthCode;
+
+  @override
+  String toString() => 'GoogleSignInAuthentication:$_data';
+}
+
+@immutable
+class GoogleSignInAccount implements GoogleIdentity {
+  GoogleSignInAccount._(this._googleSignIn, GoogleSignInUserData data)
+      : displayName = data.displayName,
+        email = data.email,
+        id = data.id,
+        photoUrl = data.photoUrl,
+        serverAuthCode = data.serverAuthCode,
+        _idToken = data.idToken {
+    assert(id != null);
+  }
+
+  static const String kFailedToRecoverAuthError = 'failed_to_recover_auth';
+  static const String kUserRecoverableAuthError = 'user_recoverable_auth';
+
+  @override
+  final String? displayName;
+
+  @override
+  final String email;
+
+  @override
+  final String id;
+
+  @override
+  final String? photoUrl;
+
+  @override
+  final String? serverAuthCode;
+
+  final String? _idToken;
+  final GoogleSignIn _googleSignIn;
+
+  Future<GoogleSignInAuthentication> get authentication async {
+    if (_googleSignIn.currentUser != this) {
+      throw StateError('User is no longer signed in.');
+    }
+
+    final GoogleSignInTokenData response =
+        await GoogleSignInPlatform.instance.getTokens(
+      email: email,
+      shouldRecoverAuth: true,
+    );
+
+    response.idToken ??= _idToken;
+
+    return GoogleSignInAuthentication._(response);
+  }
+
+  Future<Map<String, String>> get authHeaders async {
+    final String? token = (await authentication).accessToken;
+    return <String, String>{
+      'Authorization': 'Bearer $token',
+      'X-Goog-AuthUser': '0',
+    };
+  }
+
+  Future<void> clearAuthCache() async {
+    final String token = (await authentication).accessToken!;
+    await GoogleSignInPlatform.instance.clearAuthCache(token: token);
+  }
+
+  @override
+  bool operator ==(Object other) {
+    if (identical(this, other)) {
+      return true;
+    }
+    if (other is! GoogleSignInAccount) {
+      return false;
+    }
+    final GoogleSignInAccount otherAccount = other;
+    return displayName == otherAccount.displayName &&
+        email == otherAccount.email &&
+        id == otherAccount.id &&
+        photoUrl == otherAccount.photoUrl &&
+        serverAuthCode == otherAccount.serverAuthCode &&
+        _idToken == otherAccount._idToken;
+  }
+
+  @override
+  int get hashCode =>
+      Object.hash(displayName, email, id, photoUrl, _idToken, serverAuthCode);
+
+  @override
+  String toString() {
+    final Map<String, dynamic> data = <String, dynamic>{
+      'displayName': displayName,
+      'email': email,
+      'id': id,
+      'photoUrl': photoUrl,
+      'serverAuthCode': serverAuthCode
+    };
+    return 'GoogleSignInAccount:$data';
+  }
+}
+
+class GoogleSignIn {
+  GoogleSignIn({
+    this.signInOption = SignInOption.standard,
+    this.scopes = const <String>[],
+    this.hostedDomain,
+    this.clientId,
+    this.serverClientId,
+    this.forceCodeForRefreshToken = false,
+  });
+
+  factory GoogleSignIn.standard({
+    List<String> scopes = const <String>[],
+    String? hostedDomain,
+  }) {
+    return GoogleSignIn(scopes: scopes, hostedDomain: hostedDomain);
+  }
+
+  factory GoogleSignIn.games() {
+    return GoogleSignIn(signInOption: SignInOption.games);
+  }
+
+  static const String kSignInRequiredError = 'sign_in_required';
+
+  static const String kSignInCanceledError = 'sign_in_canceled';
+
+  static const String kNetworkError = 'network_error';
+
+  static const String kSignInFailedError = 'sign_in_failed';
+
+  final SignInOption signInOption;
+
+  final List<String> scopes;
+
+  final String? hostedDomain;
+  final String? clientId;
+  final String? serverClientId;
+
+  final bool forceCodeForRefreshToken;
+
+  final StreamController<GoogleSignInAccount?> _currentUserController =
+      StreamController<GoogleSignInAccount?>.broadcast();
+
+  Stream<GoogleSignInAccount?> get onCurrentUserChanged =>
+      _currentUserController.stream;
+
+  Future<void>? _initialization;
+
+  Future<GoogleSignInAccount?> _callMethod(Function method) async {
+    await _ensureInitialized();
+
+    final dynamic response = await method();
+
+    return _setCurrentUser(response != null && response is GoogleSignInUserData
+        ? GoogleSignInAccount._(this, response)
+        : null);
+  }
+
+  GoogleSignInAccount? _setCurrentUser(GoogleSignInAccount? currentUser) {
+    if (currentUser != _currentUser) {
+      _currentUser = currentUser;
+      _currentUserController.add(_currentUser);
+    }
+    return _currentUser;
+  }
+
+  Future<void> _ensureInitialized() {
+    return _initialization ??=
+        GoogleSignInPlatform.instance.initWithParams(SignInInitParameters(
+      signInOption: signInOption,
+      scopes: scopes,
+      hostedDomain: hostedDomain,
+      clientId: clientId,
+      serverClientId: serverClientId,
+      forceCodeForRefreshToken: forceCodeForRefreshToken,
+    ))
+          ..catchError((dynamic _) {
+            // Invalidate initialization if it errors out.
+            _initialization = null;
+          });
+  }
+
+  Future<void>? _lastMethodCall;
+
+  static Future<void> _waitFor(Future<void> future) {
+    final Completer<void> completer = Completer<void>();
+    future.whenComplete(completer.complete).catchError((dynamic _) {});
+    return completer.future;
+  }
+
+  Future<GoogleSignInAccount?> _addMethodCall(
+    Function method, {
+    bool canSkipCall = false,
+  }) async {
+    Future<GoogleSignInAccount?> response;
+    if (_lastMethodCall == null) {
+      response = _callMethod(method);
+    } else {
+      response = lastMethodCall!.then(() {
+        if (canSkipCall && _currentUser != null) {
+          return _currentUser;
+        }
+        return _callMethod(method);
+      });
+    }
+
+    _lastMethodCall = _waitFor(response);
+    return response;
+  }
+
+  GoogleSignInAccount? get currentUser => _currentUser;
+  GoogleSignInAccount? _currentUser;
+
+  Future<GoogleSignInAccount?> signInSilently({
+    bool suppressErrors = true,
+    bool reAuthenticate = false,
+  }) async {
+    try {
+      return await _addMethodCall(GoogleSignInPlatform.instance.signInSilently,
+          canSkipCall: !reAuthenticate);
+    } catch (_) {
+      if (suppressErrors) {
+        return null;
+      } else {
+        rethrow;
+      }
+    }
+  }
+
+  Future<bool> isSignedIn() async {
+    await _ensureInitialized();
+    return GoogleSignInPlatform.instance.isSignedIn();
+  }
+
+  Future<GoogleSignInAccount?> signIn() {
+    final Future<GoogleSignInAccount?> result =
+        _addMethodCall(GoogleSignInPlatform.instance.signIn, canSkipCall: true);
+    bool isCanceled(dynamic error) =>
+        error is PlatformException && error.code == kSignInCanceledError;
+    return result.catchError((dynamic _) => null, test: isCanceled);
+  }
+
+  Future<GoogleSignInAccount?> signOut() =>
+      _addMethodCall(GoogleSignInPlatform.instance.signOut);
+
+  Future<GoogleSignInAccount?> disconnect() =>
+      _addMethodCall(GoogleSignInPlatform.instance.disconnect);
+
+  Future<bool> requestScopes(List<String> scopes) async {
+    await _ensureInitialized();
+    return GoogleSignInPlatform.instance.requestScopes(scopes);
+  }
+}
